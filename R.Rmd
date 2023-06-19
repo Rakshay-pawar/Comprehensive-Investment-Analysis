@@ -1,0 +1,458 @@
+---
+title: "**Problem Set 8 Solutions**"
+geometry: "left=2cm,right=2cm,top=2cm,bottom=2cm"
+header-includes:
+  - \usepackage{graphicx}
+  - \usepackage{fancyhdr}
+output: 
+  #html_document
+  #  code_folding: hide
+  pdf_document
+---
+\fancypagestyle{plain}{
+  \fancyhf{}
+  \renewcommand{\headrulewidth}{0pt}
+  \fancyhead[L]{\bfseries UCLA Anderson \\ 
+  MGMTMFE 400}
+  \fancyhead[R]{\bfseries Fall 2022 \\
+  
+}
+
+
+---
+output:
+  html_document: default
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	fig.align = "center",
+	fig.height = 3.75,
+	fig.width = 6,
+	message = FALSE,
+	warning = FALSE,
+	dev = c("png"),
+	dpi = 400
+)
+```
+
+This file contains a guideline solution for the project and problems of the 7th & 8th problem set.
+
+# Project 8
+
+
+## Compute the returns
+
+```{r echo=FALSE}
+
+
+rm(list = ls())
+#load dependencies- not all of these are necessary. Tidyverse imports most of these anyway.
+library(data.table)
+library(tidyverse)
+library(magrittr)
+library(xts)
+library(lubridate)
+library(readxl)
+library(xtable)
+library(quadprog)
+library(sandwich)
+
+library(knitr)
+
+options(xtable.comment = FALSE)
+
+begindate = as.Date("1989-12-29")
+enddate = as.Date("2022-08-31")
+
+#setwd("C:\\Users\\yahsk\\Desktop\\Q1\\investments\\All HW and solutions")
+
+# Load Data
+
+ff = read_excel("C:/Users/yahsk/Desktop/Q1/investments/All HW and solutions/lecture6p_2022.xlsx", sheet = "F-F_Research_Data_Factors_daily") %>% as.data.table
+dl = list(
+        msft = read_excel("C:/Users/yahsk/Desktop/Q1/investments/All HW and solutions/lecture6p_2022.xlsx", sheet = "MSFT") %>% as.data.table,
+        intc = read_excel("C:/Users/yahsk/Desktop/Q1/investments/All HW and solutions/lecture6p_2022.xlsx", sheet = "INTC") %>% as.data.table,
+        luv = read_excel("C:/Users/yahsk/Desktop/Q1/investments/All HW and solutions/lecture6p_2022.xlsx", sheet = "LUV")  %>% as.data.table,
+        mcd = read_excel("C:/Users/yahsk/Desktop/Q1/investments/All HW and solutions/lecture6p_2022.xlsx", sheet = "MCD")  %>% as.data.table,
+        jnj = read_excel("C:/Users/yahsk/Desktop/Q1/investments/All HW and solutions/lecture6p_2022.xlsx", sheet = "JNJ")  %>% as.data.table
+)
+
+
+colnames(ff) %<>% tolower
+ff = ff[,c("date", "mktrf", "rf")]
+ff[,rf := rf / 100] 
+ff[, mktrf := mktrf / 100] 
+
+#this is excessive since we will be averaging at the end anyway
+#could have just averaged daily returns and adjusted to 5 days
+ff[,rfleveladj := cumprod(1+rf)] 
+ff[,mktrfleveladj := cumprod(1+mktrf)] 
+ff = ff[date %between% c(begindate, enddate),]
+setkey(ff, "date")
+
+
+stocknames = names(dl)
+#clean up the dataframes
+cleandt = function(d){
+  colnames(d) %<>% tolower
+  d = d[date %between% c(begindate, enddate),]  
+  setkey(d, "date")
+  d = d[,c("date", "adjclose")]
+  return(d)
+}
+for (n in stocknames){
+  dl[[n]] = cleandt(dl[[n]])
+  colnames(dl[[n]])[2] = n
+}
+
+d = ff[dl %>% reduce(merge)]
+ep = endpoints(d$date, on = "weeks")
+d = d[ep,]
+shiftret = function(x) x/shift(x) - 1
+d[,rf := rfleveladj %>% shiftret %>% shift] #recreate the new rf
+d[,mktrf := mktrfleveladj %>% shiftret] #recreate the excess market return
+d[,(stocknames) := lapply(.SD, shiftret), .SDcols=stocknames]
+
+
+d %<>% na.omit
+#d = d[-1,] #alt, doesn't work
+#print(d[, lapply(.SD, sd), .SDcols = stocknames] * 100)
+
+```
+
+1. __Construct weekly simple total returns from the price data (use Adj Close to include dividends).  Compute and report the weekly and annualized mean and standard deviation for each stock. Compute the correlation matrix.__\
+\
+Start with the standard deviation:
+```{r echo=FALSE, results='asis'}
+res = matrix(NA, nrow = 4, ncol = length(stocknames))
+colnames(res) = stocknames
+rownames(res) = c("mean-1w", "sd1w", "mean-1y", "sd-1y")
+
+res["mean-1w",] = (d[, lapply(.SD, mean), .SDcols = stocknames]) %>% as.matrix
+res["sd1w",] = (d[, lapply(.SD, sd), .SDcols = stocknames]) %>% as.matrix
+
+annret = function(r) (1+mean(r))^52-1
+res["mean-1y",] = d[, lapply(.SD, annret), .SDcols = stocknames] %>% as.matrix
+res["sd-1y",] = (d[, lapply(.SD, sd), .SDcols = stocknames] * 52^0.5) %>% as.matrix
+
+res = round((res * 100),3)
+
+print2markdown = function (d) d %>% xtable(type="html") %>% print
+library(knitr)
+kable(res)
+
+```
+Now compute the correlation matrix:
+```{r echo=FALSE, results='asis'}
+res = matrix(NA, nrow = length(stocknames), ncol = length(stocknames))
+colnames(res) = stocknames
+rownames(res) = stocknames
+res = d[, cor(.SD), .SDcols = stocknames]
+res = round((res * 100),3)
+
+print2markdown = function (d) d %>% xtable(type="html") %>% print
+kable(res)
+
+```
+
+2. __Construct the mean-variance frontier for the Intel-Microsoft combination. Indicate the minimum-variance portfolio and the efficient frontier (the efficient frontier is a set of expected returns - risks that you would want to consider investing in).__\
+\
+Start by creating a some generic functions for computing the minimum variance frontier.
+
+```{r echo=FALSE, results='asis'}
+
+#pre-load a bunch of the computation
+setupminvol = function(z,S) {
+  n=length(z)
+  some1s = rep(1,n)
+  some0s = rep(0,n)
+  A = cbind(some1s,z) #constraint matrix
+  Si = solve(S)
+
+  return(list(S=S, Si=Si, z=z, n=n, some1s=some1s, some0s=some0s, some1s, A=A))
+}
+  
+
+minvol = function(targ, p) solve.QP(2*p$S, p$some0s, p$A, 
+                                    c(1,targ), meq=2)$value
+minvolw = function(targ, p) solve.QP(2*p$S, p$some0s, p$A, 
+                                     c(1,targ), meq=2)$solution
+
+
+
+```
+Next, run the functions for the two focal stocks and plot the results:
+
+```{r echo=FALSE, results='asis'}
+targstocks2 = c("msft", "intc")
+S2 = d[, var(.SD), .SDcols = targstocks2]
+z2 = d[, lapply(.SD, mean), .SDcols = targstocks2]  %>% as.matrix %>% t
+
+p2 = setupminvol(z2, S2)
+delta = 10^(-7)
+targrets = seq(from=0.002,to=.007, by = delta)
+vols2 = sapply(targrets, function(targ) minvol(targ, p2))
+vols2 = vols2^0.5
+
+
+#identify the global min var portfolio
+volmin2 = min(vols2) #find the global min variance portfolio
+rmin2 = targrets[which(vols2 == volmin2)] 
+pos2 = ifelse(targrets <= rmin2, "2", "1")
+df2 = data.frame(x=vols2, y=targrets, pos=pos2, frontier="2 stocks")
+
+#this will make our graph look cleaner
+specialpoints2 = data.frame(x=c(sqrt(diag(p2$S)),volmin2), 
+                            y=c(p2$z, rmin2), pt=c(targstocks2, "global min"))
+
+#graph the frontier
+pl2 = ggplot() + 
+    geom_line(data=df2, mapping = aes(x=x,y=y, linetype=pos), show.legend=FALSE) +
+    geom_point(data=specialpoints2, mapping = aes(x=x,y=y, colour=pt), size=3)
+
+#polish the graph a bit
+pl2 = pl2 +  coord_cartesian(xlim = c(0.02, 0.07), ylim = c(0.002, 0.006)) +
+  labs(y = "Weekly Expected Return", x = "Weekly Standard Deviation") +
+  theme_classic() +
+  theme(legend.position="bottom")  +
+  theme(legend.title=element_blank())
+
+print(pl2)
+
+```
+
+
+3. __Add remaining stocks to the mix. Compute the mean-variance frontier and plot it on the same chart with the one from the previous question. Indicate the minimum-variance portfolio and the efficient frontier. How do they compare to those of the previous question?__\
+\
+We already did most of the workin in the previous question. Adding more assets is just a 
+matter of calling the functions for more stocks.\
+\
+The additional stocks move the minimum frontier upward and inward. Of course, the marginal effect
+declines as the number of assets increases.
+
+```{r echo=FALSE, results='asis'}
+targstocks5 = stocknames
+S5 = d[, var(.SD), .SDcols = targstocks5]
+z5 = d[, lapply(.SD, mean), .SDcols = targstocks5]  %>% as.matrix %>% t
+
+p5 = setupminvol(z5, S5)
+vols5 = sapply(targrets, function(targ) minvol(targ, p5))
+vols5 = vols5^0.5
+
+volmin5 = min(vols5) #find the global min variance portfolio
+rmin5 = targrets[which(vols5 == volmin5)] 
+pos5 = ifelse(targrets <= rmin5, "2", "1")
+df5 = data.frame(x=vols5, y=targrets, pos=pos5, frontier="5 stocks")
+df25 = rbind(df2, df5)
+
+specialpoints25 = data.frame(x=c(sqrt(diag(p5$S)),volmin2, volmin5), 
+                             y=c(p5$z, rmin2, rmin5), pt=c(targstocks5, 
+                                                           "2-stocks min", "5-stocks min"))
+
+#graph the frontiers
+pl25 = ggplot() + 
+  geom_path(data=df25, mapping = aes(x=x,y=y, linetype=frontier), show.legend=FALSE) +
+  scale_linetype_manual(values=c(2,1)) + 
+  geom_point(data=specialpoints25, mapping = aes(x=x,y=y, colour=pt), size=3)+
+  coord_cartesian(xlim = c(0.02, 0.07), ylim = c(0.002, 0.006)) +
+  labs(y = "Weekly Expected Return", x = "Weekly Standard Deviation") +
+  theme_classic() +
+  theme(legend.position="bottom")  +
+  theme(legend.title=element_blank())
+
+print(pl25)
+
+```
+
+4. __Add the riskless asset and construct the tangent portfolio for the Intel-Microsoft case. Next, construct the tangent portfolio for the full set of stocks. Compare the Sharpe ratios of the two tangent portfolios.__\
+\
+```{r echo=FALSE, results='asis'}
+  rfr = mean(d$rf) #0.0005334299 in 2019 for testing purposes
+  cat("Construct the tangency portfolios given the risk free rate of ", 
+      round(rfr*100,4),"%.", sep="")
+
+  sharpe2 = (targrets-rfr)/vols2
+  sharpe5 = (targrets-rfr)/vols5
+  
+  tang2 = which(sharpe2==max(sharpe2))
+  tang5 = which(sharpe5==max(sharpe5))
+  
+  tangports = data.frame(x=c(vols2[tang2], vols5[tang5]), y=c(targrets[tang2], targrets[tang5]), 
+                         intercepts=c(rfr,rfr),
+                         slopes=c(sharpe2[tang2], sharpe5[tang5]),
+                         portfolio=paste0("Sharpe=",round(c(sharpe2[tang2], sharpe5[tang5]),4)))
+
+  pls = ggplot() + 
+    geom_path(data=df25, mapping = aes(x=x,y=y, linetype=frontier)) +
+    scale_linetype_manual(values=c(2,1,2,1), guide="none") + 
+    geom_point(data=specialpoints25, mapping = aes(x=x,y=y, colour=pt), size=3) +
+    geom_abline(tangports, mapping=aes(slope=slopes, intercept=intercepts, linetype=portfolio)) +
+    geom_point(tangports, mapping=aes(x=x,y=y, shape=portfolio), size=4) +
+    coord_cartesian(xlim = c(0.02, 0.07), ylim = c(0.002, 0.006)) +
+    labs(y = "Weekly Expected Return", x = "Weekly Standard Deviation")+
+    theme_classic() +
+    #theme(legend.position="bottom")  +
+    theme(legend.title=element_blank())
+
+  print(pls)
+```
+
+
+5. __Assume your risk aversion is A = 3.5: What is your optimal mix of assets?__\
+\
+Use the formula: 
+$$
+\begin{aligned}
+  w_{risky} &= \frac{E(R_{tang}) - R_{f}}{A \cdot V(R_{tang})}
+\end{aligned}
+$$
+
+Compute the portfolio weight as the product of the tangency weights and the weight on the tangency portfolio. The risk-free portfolio weight is the residual. The negative weight implies borrowing, while a positive rate would have implied a risk-free bond investment.
+
+```{r echo=FALSE, results='asis'}
+#get the tangency weights
+A=3.5
+w5 = minvolw(targrets[tang5], p5)
+
+#compute the weight on the risky and risk-free portfolio
+wrisky = (targrets[tang5] - rfr)/(A*vols5[tang5]^2)
+wrfr = 1-wrisky
+
+res = matrix(NA, nrow = length(stocknames)+1, ncol = 2)
+colnames(res) = c("wtangent", "w(A=3.5)")
+rownames(res) = c(stocknames, "RFR")
+res[1:length(stocknames),"wtangent"] = w5
+res[,"w(A=3.5)"] =c(wrisky*w5, wrfr)
+res = round(res*100,3)
+kable(res)
+
+cat("The weight on the risky portfolio is ",round(wrisky*100,3),
+    ", implying a weight of ", round(wrfr*100,3), " on the risk-free asset.", sep="")
+
+```
+
+
+
+
+
+\newpage
+6. __Regress excess stock returns on excess market returns to obtain estimates of the betas of the five stocks. Compute the standard errors of your estimates.__\
+\
+    Run the regressions. Specifically I run the following:
+$$
+\begin{aligned}
+  R_i-R_f = \beta_i \times (R_m - R_f) + \alpha_i + \epsilon
+\end{aligned}
+$$
+    
+    By running the regressions this way, I can interpret the intercept as $\alpha$ in excess of the risk free rate. Standard errors should be robust (at a minimum) as the assumptions behind homoskedastic errors do not apply to most financial time series data. The sandwich package is well suited for this if using the base lm package. I use Modified White standard errors ("HC3"). 
+```{r echo=FALSE, results='asis'}
+regstock = function(stock) {
+  mkt="mktrf"
+  intercept = "(Intercept)"
+  
+  #we compute attributes for 7 and 8 as well as 6
+  f = as.formula(paste0(stock, " ~ ", mkt))
+  m = lm(f, data=d)
+  beta = m$coefficients[[mkt]]
+  alpha = m$coefficients[[intercept]]
+  sigma = vcov(m)
+  sigmahc = vcovHC(m, type="HC3")
+  betase = sigma[mkt,mkt]^0.5
+  alphase = sigma[intercept,intercept]^0.5
+  residse = sd(m$residuals)
+  actr = d[[stock]]  %>% mean
+  capmr = actr - alpha #technically this is the capm excess return
+  
+  return (list(stock=stock, beta=beta, alpha=alpha, 
+               betase=betase, alphase=alphase,
+               residse=residse, actr=actr, capmr=capmr))
+}
+
+#want to run these regressions using excess returns on the LHS and RHS
+estocknames = paste0("e", stocknames)
+d[,(estocknames) := lapply(.SD, function (x)  x - d$rf), .SDcols=stocknames]
+regs =  lapply(estocknames, regstock)
+names(regs) = stocknames
+```
+
+
+
+  
+    Now just format and print the tables:
+
+```{r echo=FALSE, results='asis'}
+q6 = matrix(NA, nrow = length(stocknames), ncol = 2)
+colnames(q6) = c("beta", "error (Mod-White)")
+rownames(q6) = stocknames
+for (n in stocknames) {
+  q6[n,"beta"] = regs[[n]]$beta
+  q6[n,"error (Mod-White)"] = regs[[n]]$betase
+}
+
+
+kable(q6, digits = 3)
+```
+7. __What are the estimates of the alphas, and the standard deviation of these estimates? Further estimate the idiosyncratic risk.__\
+\
+    This is just reading off different parts of the regression results. The idiosyncratic risk is the standard deviation of the residuals.\
+```{r echo=FALSE, results='asis'}
+q7 = matrix(NA, nrow = length(stocknames), ncol = 3)
+colnames(q7) = c("alpha (bp)", "alpha se (bp)", "idiosync. risk (bp)")
+rownames(q7) = stocknames
+for (n in stocknames) {
+  q7[n,"alpha (bp)"] = regs[[n]]$alpha*10000
+  q7[n,"alpha se (bp)"] = regs[[n]]$alphase*10000
+  q7[n,"idiosync. risk (bp)"] = regs[[n]]$residse*10000
+
+}
+
+
+kable(q7, digits = 3)
+
+```    
+
+```{r}
+beta_values = sapply(stocknames, function(n) regs[[n]]$capmr)
+print(beta_values)
+
+```
+
+
+```{r}
+mean(d$rf)
+```
+
+
+\
+8. __Compute the sample average excess return and compare the value with the return predicted by the CAPM. Based on the data, how well does the CAPM predict the level returns? How well does the CAPM predict relative performance?__\
+  \
+  Again, the work is already complete. Since we used excess returns on the LHS of the regression, the expected CAPM return is just the expected realized return less the expected alpha. Plug in the means to     get the estimates:\
+```{r echo=FALSE, results='asis'}
+q8 = matrix(NA, nrow = length(stocknames), ncol = 5)
+colnames(q8) = c("beta", "predicted r (bp)", "actual r (bp)", 
+                 "predicted excess (bp)", "actual excess (bp)")
+rownames(q8) = stocknames
+for (n in stocknames) {
+  q8[n,"beta"] = regs[[n]]$beta
+  q8[n,"predicted r (bp)"] = (regs[[n]]$capmr + mean(d$rf))*10000
+  q8[n,"actual r (bp)"] = mean(d[[n]]) * 10000
+  q8[n,"predicted excess (bp)"] = regs[[n]]$capmr*10000 
+  q8[n,"actual excess (bp)"] = regs[[n]]$actr * 10000
+
+}
+
+
+kable(q8, digits = 3)
+
+
+
+```
+The CAPM predicts a high return for INTC and a low return for MCD and JNJ. This is indeed the case, though the rank ordering changes a small amount. However, the CAPM markedly misses the level of returns, with substantial alphas. From the estimates in part b, the alphas for each stock are either significant or nearly significant. Overall, the data suggest that the CAPM is misspecified, though it retains some power to explain differences in returns between stocks.
+\newpage
+```
+
